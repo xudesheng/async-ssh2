@@ -17,6 +17,8 @@ use std::{
     sync::Arc,
 };
 use futures::{AsyncReadExt, AsyncWriteExt, FutureExt, select};
+use log::{debug, error,  trace};
+
 /// See [`Session`](ssh2::Session).
 pub struct Session {
     inner: ssh2::Session,
@@ -153,35 +155,35 @@ impl Session {
                 select! {
                     ret_forward_stream_r = forward_stream_r.read(&mut buf_forward_stream_r).fuse() => match ret_forward_stream_r{
                         Ok(n) if n == 0 => {
-                            println!("forward_stream_r closed.");
+                            debug!("forward_stream_r closed.");
                             break;
                         },
                         Ok(n) => {
-                            println!("forward_stream_r read {} bytes.",n);
+                            trace!("forward_stream_r read {} bytes.",n);
                             bastion_channel.write_all(&buf_forward_stream_r[..n]).await.map(|_| ()).map_err(|err| {
                                 eprintln!("bastion_channel write failed, err: {:?}",err);
                                 err
                             })?;
                         },
                         Err(err) => {
-                            eprintln!("forward_stream_r read failed, err: {:?}",err);
+                            error!("forward_stream_r read failed, err: {:?}",err);
                             return Err(err);
                         }
                     },
                     ret_bastion_channel = bastion_channel.read(&mut buf_bastion_channel).fuse() => match ret_bastion_channel {
                         Ok(n) if n == 0 => {
-                            println!("bastion_channel closed.");
+                            debug!("bastion_channel closed.");
                             break;
                         },
                         Ok(n) => {
-                            println!("bastion_channel read {} bytes.",n);
+                            trace!("bastion_channel read {} bytes.",n);
                             forward_stream_r.write_all(&buf_bastion_channel[..n]).await.map(|_| ()).map_err(|err| {
                                 eprintln!("forward_stream_s write failed, err: {:?}",err);
                                 err
                             })?;
                         },
                         Err(err) => {
-                            eprintln!("bastion_channel read failed, err: {:?}",err);
+                            error!("bastion_channel read failed, err: {:?}",err);
                             return Err(err);
                         }
                     },

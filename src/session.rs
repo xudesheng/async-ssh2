@@ -12,11 +12,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::{
     convert::From,
-    net::TcpStream,
+    net::{TcpStream,TcpListener},
     path::Path,
     sync::Arc,
 };
-
+use futures::{AsyncReadExt, AsyncWriteExt, FutureExt, select};
 /// See [`Session`](ssh2::Session).
 pub struct Session {
     inner: ssh2::Session,
@@ -124,6 +124,76 @@ impl Session {
         }
         self.stream = Some(Arc::new(stream));
         Ok(())
+    }
+
+    pub async fn proxy_session(&self, target_ip:&str, target_port:u16,src:Option<(&str,u16)>) -> Result<Session,Error>{
+        let mut bastion_channel = self.channel_direct_tcpip(target_ip,target_port,src).await?;
+        let (forward_stream_s, mut forward_stream_r) = {
+            cfg_if::cfg_if! {
+                if #[cfg(unix)] {
+                    let dir = tempdir();
+                    let path = dir.path().join("ssh_channel_direct_tcpip");
+                    let listener = Async::<UnixListener>::bind(&path)?;
+                    let stream_s = Async::<UnixStream>::accept(&path).await?;
+                }else{
+                    let listen_addr = TcpListener::bind("localhost:0").unwrap().local_addr().unwrap();
+                    let listener = Async::<TcpListener>::bind(listen_addr)?;
+                    let stream_s = Async::<TcpStream>::connect(listen_addr).await?;
+                }
+            }
+            let (stream_r, _) = listener.accept().await?;
+            (stream_s, stream_r)
+        };
+
+        let _backend_task = tokio::spawn(async move {
+            let mut buf_bastion_channel = vec![0; 2048];
+            let mut buf_forward_stream_r = vec![0; 2048];
+            
+            loop {
+                select! {
+                    ret_forward_stream_r = forward_stream_r.read(&mut buf_forward_stream_r).fuse() => match ret_forward_stream_r{
+                        Ok(n) if n == 0 => {
+                            println!("forward_stream_r closed.");
+                            break;
+                        },
+                        Ok(n) => {
+                            println!("forward_stream_r read {} bytes.",n);
+                            bastion_channel.write_all(&buf_forward_stream_r[..n]).await.map(|_| ()).map_err(|err| {
+                                eprintln!("bastion_channel write failed, err: {:?}",err);
+                                err
+                            })?;
+                        },
+                        Err(err) => {
+                            eprintln!("forward_stream_r read failed, err: {:?}",err);
+                            return Err(err);
+                        }
+                    },
+                    ret_bastion_channel = bastion_channel.read(&mut buf_bastion_channel).fuse() => match ret_bastion_channel {
+                        Ok(n) if n == 0 => {
+                            println!("bastion_channel closed.");
+                            break;
+                        },
+                        Ok(n) => {
+                            println!("bastion_channel read {} bytes.",n);
+                            forward_stream_r.write_all(&buf_bastion_channel[..n]).await.map(|_| ()).map_err(|err| {
+                                eprintln!("forward_stream_s write failed, err: {:?}",err);
+                                err
+                            })?;
+                        },
+                        Err(err) => {
+                            eprintln!("bastion_channel read failed, err: {:?}",err);
+                            return Err(err);
+                        }
+                    },
+                }
+            }
+            
+            Ok(())
+        });
+
+        let mut child_sess = Session::new()?;
+        child_sess.set_tcp_stream(forward_stream_s)?;
+        Ok(child_sess)
     }
 
     /// See [`userauth_password`](ssh2::Session::userauth_password).
